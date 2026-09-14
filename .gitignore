@@ -1,0 +1,5 @@
+# Root-level exclusions
+.DS_Store
+*.swp
+*.log
+*.bak

@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(./gradlew :app:assembleDebug --console=plain)",
+      "Bash(adb devices *)",
+      "Bash(adb shell *)",
+      "Bash(nohup /Users/hanrui/Library/Android/sdk/emulator/emulator -avd Pixel_9_Pro_-_37 -no-snapshot -no-boot-anim)",
+      "Bash(disown)",
+      "Bash(echo \"launched pid=$!\")"
+    ]
+  }
+}
