@@ -13,16 +13,10 @@ import android.bluetooth.BluetoothGattCallback
 import android.bluetooth.BluetoothGattCharacteristic
 import android.bluetooth.BluetoothManager
 import android.bluetooth.BluetoothProfile
-import android.bluetooth.le.BluetoothLeScanner
-import android.bluetooth.le.ScanCallback
-import android.bluetooth.le.ScanFilter
-import android.bluetooth.le.ScanResult
-import android.bluetooth.le.ScanSettings
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.os.IBinder
-import android.os.ParcelUuid
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
@@ -34,72 +28,52 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
-import java.util.concurrent.atomic.AtomicBoolean
 
-class BleForegroundService : Service() {
+/**
+ * One-shot service: connects to a single already-known device, reads the timestamp
+ * characteristic, then stops itself. Started by [BleCompanionDeviceService] when the
+ * CompanionDeviceManager reports the paired peripheral is nearby — no scanning here,
+ * the system already found and identified the device before this service is started.
+ */
+class BleConnectService : Service() {
 
     companion object {
-        private const val TAG = "BleForegroundService"
+        private const val TAG = "BleConnectService"
     }
 
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
-    private var scanLoopJob: Job? = null
     private var connectTimeoutJob: Job? = null
 
     private val bluetoothManager by lazy { getSystemService(BluetoothManager::class.java) }
     private val bluetoothAdapter: BluetoothAdapter? by lazy { bluetoothManager?.adapter }
-    private var bleScanner: BluetoothLeScanner? = null
     private var bluetoothGatt: BluetoothGatt? = null
-
-    // True while a scan is actively running.
-    private val isScanning = AtomicBoolean(false)
-
-    // True from the moment a matching device is found until the connection attempt
-    // (success or failure) fully resolves. Blocks new scans while set.
-    private val isBusy = AtomicBoolean(false)
 
     override fun onCreate() {
         super.onCreate()
         createNotificationChannel()
-        BleRepository.setRunning(true)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        if (intent?.action == BleConstants.ACTION_STOP) {
-            ServiceRunPrefs.setShouldRun(this, false)
-            shutDown()
-            return START_NOT_STICKY
-        }
-
-        // Required by the platform any time the service is started via startForegroundService(),
-        // including an automatic system restart with a null intent — so this always runs first.
+        // Required by the platform any time the service is started via startForegroundService().
         startForegroundWithNotification()
 
-        if (!ServiceRunPrefs.shouldRun(this)) {
-            // Respawned (e.g. after the user stopped it, or after a task swipe) without the user
-            // asking for it again. Don't resume scanning — shut back down immediately.
+        val address = intent?.getStringExtra(BleConstants.EXTRA_DEVICE_ADDRESS)
+        val device = address?.let { runCatching { bluetoothAdapter?.getRemoteDevice(it) }.getOrNull() }
+        if (device == null) {
+            Log.e(TAG, "No usable device address in start intent, stopping")
+            setStatus(BleStatus.ERROR, "No device address provided")
             shutDown()
             return START_NOT_STICKY
         }
 
-        if (scanLoopJob == null) {
-            startScanLoop()
-        }
-        return START_STICKY
-    }
-
-    override fun onTaskRemoved(rootIntent: Intent?) {
-        // The user swiped the app away from Recents: treat this the same as pressing "Stop".
-        ServiceRunPrefs.setShouldRun(this, false)
-        shutDown()
-        super.onTaskRemoved(rootIntent)
+        connectToDevice(device)
+        return START_NOT_STICKY
     }
 
     private fun shutDown() {
@@ -110,13 +84,9 @@ class BleForegroundService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onDestroy() {
-        scanLoopJob?.cancel()
         connectTimeoutJob?.cancel()
-        stopBleScan()
         closeGatt()
         serviceScope.cancel()
-        BleRepository.updateStatus(BleStatus.IDLE)
-        BleRepository.setRunning(false)
         super.onDestroy()
     }
 
@@ -159,7 +129,7 @@ class BleForegroundService : Service() {
         try {
             startForeground(
                 BleConstants.NOTIFICATION_ID,
-                buildNotification("Starting..."),
+                buildNotification("Device nearby, connecting..."),
                 ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
             )
             Log.d(TAG, "startForeground() succeeded")
@@ -178,74 +148,10 @@ class BleForegroundService : Service() {
         updateNotification(notificationText)
     }
 
-    // ---- Scan loop: scan for SCAN_DURATION_MS every SCAN_CYCLE_MS ----
-
-    private fun startScanLoop() {
-        scanLoopJob = serviceScope.launch {
-            while (isActive) {
-                if (!isBusy.get()) {
-                    startBleScan()
-                    delay(BleConstants.SCAN_DURATION_MS)
-                    stopBleScan()
-                    if (!isBusy.get()) {
-                        setStatus(BleStatus.IDLE, "Waiting for next scan window")
-                    }
-                }
-                delay(BleConstants.SCAN_CYCLE_MS - BleConstants.SCAN_DURATION_MS)
-            }
-        }
-    }
-
     private fun hasPermission(permission: String) =
         ContextCompat.checkSelfPermission(this, permission) == PackageManager.PERMISSION_GRANTED
 
-    private fun hasScanPermission() = hasPermission(Manifest.permission.BLUETOOTH_SCAN)
     private fun hasConnectPermission() = hasPermission(Manifest.permission.BLUETOOTH_CONNECT)
-
-    private fun startBleScan() {
-        if (isScanning.get() || isBusy.get()) return
-        if (!hasScanPermission()) {
-            setStatus(BleStatus.ERROR, "Missing BLUETOOTH_SCAN permission")
-            return
-        }
-        val adapter = bluetoothAdapter
-        if (adapter == null || !adapter.isEnabled) {
-            setStatus(BleStatus.ERROR, "Bluetooth is disabled")
-            return
-        }
-        val scanner = adapter.bluetoothLeScanner ?: return
-        bleScanner = scanner
-
-        val filter = ScanFilter.Builder()
-            .setServiceUuid(ParcelUuid(BleConstants.SERVICE_UUID))
-            .build()
-        val settings = ScanSettings.Builder()
-            .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
-            .build()
-
-        isScanning.set(true)
-        setStatus(BleStatus.SCANNING)
-        scanner.startScan(listOf(filter), settings, scanCallback)
-    }
-
-    private fun stopBleScan() {
-        if (!isScanning.getAndSet(false)) return
-        if (!hasScanPermission()) return
-        bleScanner?.stopScan(scanCallback)
-    }
-
-    private val scanCallback = object : ScanCallback() {
-        override fun onScanResult(callbackType: Int, result: ScanResult) {
-            if (isBusy.getAndSet(true)) return
-            stopBleScan()
-            connectToDevice(result.device)
-        }
-
-        override fun onScanFailed(errorCode: Int) {
-            isScanning.set(false)
-            setStatus(BleStatus.ERROR, "Scan failed: code $errorCode")
-        }
-    }
 
     // ---- Connect / discover / read ----
 
@@ -256,7 +162,7 @@ class BleForegroundService : Service() {
     private fun connectToDevice(device: BluetoothDevice) {
         if (!hasConnectPermission()) {
             setStatus(BleStatus.ERROR, "Missing BLUETOOTH_CONNECT permission")
-            isBusy.set(false)
+            shutDown()
             return
         }
         setStatus(BleStatus.CONNECTING, "Connecting to ${device.address}")
@@ -264,7 +170,7 @@ class BleForegroundService : Service() {
             delay(BleConstants.CONNECT_TIMEOUT_MS)
             setStatus(BleStatus.ERROR, "Connection timed out")
             closeGatt()
-            isBusy.set(false)
+            shutDown()
         }
         bluetoothGatt = device.connectGatt(this, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
     }
@@ -282,7 +188,7 @@ class BleForegroundService : Service() {
                     connectTimeoutJob?.cancel()
                     setStatus(BleStatus.DISCONNECTED, "Disconnected from ${gatt.device.address}")
                     closeGatt()
-                    isBusy.set(false)
+                    shutDown()
                 }
             }
         }
@@ -332,7 +238,7 @@ class BleForegroundService : Service() {
             bluetoothGatt?.disconnect()
         } else {
             closeGatt()
-            isBusy.set(false)
+            shutDown()
         }
     }
 
