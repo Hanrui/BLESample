@@ -50,8 +50,15 @@ import com.adrexample.blescannerdemo_cdm.ble.AssociationPrefs
 import com.adrexample.blescannerdemo_cdm.ble.BleConstants
 import com.adrexample.blescannerdemo_cdm.ble.BleRepository
 import com.adrexample.blescannerdemo_cdm.ble.BleStatus
+import com.adrexample.blescannerdemo_cdm.ble.GattTimestampReader
 import com.adrexample.blescannerdemo_cdm.ble.TimestampLogEntry
 import com.adrexample.blescannerdemo_cdm.ui.theme.BLEScannerDemoTheme
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import java.util.Locale
 
 class MainActivity : ComponentActivity() {
@@ -72,6 +79,8 @@ class MainActivity : ComponentActivity() {
     private lateinit var intentSenderLauncher: ActivityResultLauncher<IntentSenderRequest>
     private var pendingStart = false
     private var pendingBondAssociationId: Int? = null
+
+    private val activityScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
 
     private val bondStateReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
@@ -134,6 +143,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onDestroy() {
         unregisterReceiver(bondStateReceiver)
+        activityScope.cancel()
         super.onDestroy()
     }
 
@@ -149,11 +159,12 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private fun findExistingAssociation(associationId: Int): AssociationInfo? =
+        companionDeviceManager.myAssociations.find { it.id == associationId }
+
     private fun startAssociationFlow() {
         val existingId = AssociationPrefs.getAssociationId(this)
-        val existingInfo = existingId?.let { id ->
-            companionDeviceManager.myAssociations.find { it.id == id }
-        }
+        val existingInfo = existingId?.let { id -> findExistingAssociation(id) }
         if (existingInfo != null) {
             bondAndObserve(existingInfo)
             return
@@ -215,7 +226,7 @@ class MainActivity : ComponentActivity() {
         }
 
         if (device.bondState == BluetoothDevice.BOND_BONDED) {
-            startObserving(info.id)
+            startObservingAndConnect(info.id, device)
             return
         }
 
@@ -228,8 +239,34 @@ class MainActivity : ComponentActivity() {
         if (!device.createBond()) {
             pendingBondAssociationId = null
             if (device.bondState == BluetoothDevice.BOND_BONDED) {
-                startObserving(info.id)
+                startObservingAndConnect(info.id, device)
             } else {
+                BleRepository.updateStatus(BleStatus.ERROR)
+            }
+            return
+        }
+
+        // The ACTION_BOND_STATE_CHANGED broadcast is the fast path, but it isn't always
+        // delivered promptly (or at all) for every OEM/peripheral combination. Poll the bond
+        // state directly as a fallback so a single button press reliably converges instead of
+        // silently waiting forever on a broadcast that never arrives.
+        BleRepository.updateStatus(BleStatus.BONDING)
+        pollUntilBonded(info.id, device)
+    }
+
+    private fun pollUntilBonded(associationId: Int, device: BluetoothDevice) {
+        activityScope.launch {
+            val deadline = System.currentTimeMillis() + BleConstants.BOND_TIMEOUT_MS
+            while (pendingBondAssociationId == associationId && System.currentTimeMillis() < deadline) {
+                if (device.bondState == BluetoothDevice.BOND_BONDED) {
+                    pendingBondAssociationId = null
+                    startObservingAndConnect(associationId, device)
+                    return@launch
+                }
+                delay(500)
+            }
+            if (pendingBondAssociationId == associationId) {
+                pendingBondAssociationId = null
                 BleRepository.updateStatus(BleStatus.ERROR)
             }
         }
@@ -245,9 +282,19 @@ class MainActivity : ComponentActivity() {
         BleRepository.updateStatus(BleStatus.OBSERVING)
     }
 
+    // The device is already right here the moment bonding finishes -- connect and read now
+    // instead of waiting for CDM's independent presence engine to fire EVENT_BLE_APPEARED,
+    // which may not happen until the device leaves and re-enters range.
+    private fun startObservingAndConnect(associationId: Int, device: BluetoothDevice) {
+        startObserving(associationId)
+        GattTimestampReader.connectAndRead(this, associationId, device)
+    }
+
     private fun stopObserving() {
         val associationId = AssociationPrefs.getAssociationId(this) ?: return
-        stopObservingRequest(associationId)
+        if (findExistingAssociation(associationId) != null) {
+            stopObservingRequest(associationId)
+        }
         AssociationPrefs.setObserving(this, false)
         BleRepository.setObserving(false)
         BleRepository.updateStatus(BleStatus.IDLE)
@@ -262,15 +309,20 @@ class MainActivity : ComponentActivity() {
 
     private fun forgetDevice() {
         val associationId = AssociationPrefs.getAssociationId(this) ?: return
-        stopObservingRequest(associationId)
-        if (ContextCompat.checkSelfPermission(
-                this,
-                Manifest.permission.BLUETOOTH_CONNECT
-            ) == PackageManager.PERMISSION_GRANTED
-        ) {
-            companionDeviceManager.removeBond(associationId)
+        // The stored association id may be stale (e.g. it was already removed on the system
+        // side). CDM throws IllegalArgumentException from these calls for an unknown id instead
+        // of no-oping, so only touch the system association if it's still actually there.
+        if (findExistingAssociation(associationId) != null) {
+            stopObservingRequest(associationId)
+            if (ContextCompat.checkSelfPermission(
+                    this,
+                    Manifest.permission.BLUETOOTH_CONNECT
+                ) == PackageManager.PERMISSION_GRANTED
+            ) {
+                companionDeviceManager.removeBond(associationId)
+            }
+            companionDeviceManager.disassociate(associationId)
         }
-        companionDeviceManager.disassociate(associationId)
         pendingBondAssociationId = null
         AssociationPrefs.clear(this)
         BleRepository.setObserving(false)

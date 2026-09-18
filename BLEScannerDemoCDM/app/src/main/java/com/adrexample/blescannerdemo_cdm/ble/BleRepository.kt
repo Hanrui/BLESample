@@ -10,6 +10,7 @@ import java.util.concurrent.atomic.AtomicLong
 
 enum class BleStatus(val label: String) {
     IDLE("Idle"),
+    BONDING("Bonding..."),
     OBSERVING("Observing for device presence..."),
     DEVICE_APPEARED("Device appeared"),
     CONNECTING("Connecting..."),
