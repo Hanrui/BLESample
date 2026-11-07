@@ -1,5 +1,21 @@
-# Root-level exclusions
+# Gradle cache & daemon state (any depth)
+.gradle/
+
+# Build outputs & compiler artifacts (any depth)
+build/
+bin/
+out/
+
+# Android Studio / IntelliJ local metadata
+.idea/
+*.iml
+.cxx/
+local.properties
+Captures/
+
+# OS metadata
 .DS_Store
+Thumbs.db
 *.swp
 *.log
 *.bak
