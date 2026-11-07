@@ -10,7 +10,7 @@ import java.util.concurrent.atomic.AtomicLong
 
 enum class BleStatus(val label: String) {
     IDLE("Idle"),
-    SCANNING("Scanning..."),
+    OBSERVING("Observing for device..."),
     CONNECTING("Connecting..."),
     DISCOVERING_SERVICES("Discovering services..."),
     READING_CHARACTERISTIC("Reading characteristic..."),
@@ -28,15 +28,15 @@ data class TimestampLogEntry(
 )
 
 /**
- * In-process bridge between the foreground service and the Compose UI.
+ * In-process bridge between the companion device service / activity and the Compose UI.
  * Both sides observe the same StateFlow instances, so no broadcast/binder plumbing is needed.
  */
 object BleRepository {
     private val _status = MutableStateFlow(BleStatus.IDLE)
     val status: StateFlow<BleStatus> = _status.asStateFlow()
 
-    private val _isRunning = MutableStateFlow(false)
-    val isRunning: StateFlow<Boolean> = _isRunning.asStateFlow()
+    private val _isAssociated = MutableStateFlow(false)
+    val isAssociated: StateFlow<Boolean> = _isAssociated.asStateFlow()
 
     private val _logs = MutableStateFlow<List<TimestampLogEntry>>(emptyList())
     val logs: StateFlow<List<TimestampLogEntry>> = _logs.asStateFlow()
@@ -48,8 +48,8 @@ object BleRepository {
         _status.value = status
     }
 
-    fun setRunning(running: Boolean) {
-        _isRunning.value = running
+    fun setAssociated(associated: Boolean) {
+        _isAssociated.value = associated
     }
 
     fun addLog(deviceName: String?, deviceAddress: String, timestampText: String) {
