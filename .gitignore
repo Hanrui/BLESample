@@ -1,6 +1,10 @@
 # Gradle cache & daemon state (any depth)
 .gradle/
 
+# Claude files (any depth)
+.Claude/
+.claude/
+
 # Build outputs & compiler artifacts (any depth)
 build/
 bin/
